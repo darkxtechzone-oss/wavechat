@@ -1,0 +1,49 @@
+name: Build APK
+
+on: [push, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build APK
+        run: |
+          set +e
+          gradle assembleRelease -PverCode=${{ github.run_number }} --console=plain 2>&1 | tee build.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            {
+              echo "## Build errors"
+              echo '```'
+              grep -E "^e: |error:|What went wrong|Execution failed|AAPT" -A3 build.log | head -80
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            grep -E "^e: " build.log | head -20 | sed 's/^/::error::/'
+          fi
+          exit $code
+
+      - name: Prepare APK
+        run: cp app/build/outputs/apk/release/app-release.apk WaveChat.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WaveChat-apk
+          path: WaveChat.apk

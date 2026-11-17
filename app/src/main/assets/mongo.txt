@@ -1,0 +1,1 @@
+mongodb+srv://darkxtechzone_db_user:Nk3FFXNk2uWs1zJx@mussah.dlu8dvd.mongodb.net/darkxyt?retryWrites=true&w=majority
