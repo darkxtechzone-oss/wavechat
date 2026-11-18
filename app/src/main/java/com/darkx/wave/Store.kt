@@ -2,24 +2,43 @@ package com.darkx.wave
 
 import android.content.ContentValues
 import android.content.Context
+import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
-class Chat(val peer: String, val name: String, val last: String, val lastTs: Long, val unread: Int)
+class Chat(val peer: String, val name: String, val last: String, val lastTs: Long, val unread: Int, val avatar: String = "")
 
 /** status: 0 = sending, 1 = sent to the server, 2 = delivered, 3 = failed, 4 = received */
-class Msg(val id: String, val peer: String, val mine: Boolean, val body: String, val ts: Long, val status: Int)
+class Msg(val id: String, val peer: String, val mine: Boolean, val body: String, val ts: Long, val status: Int, val sender: String = "")
 
-/** Messages live on the phone. One database file per account. */
+class Person(val user: String, val name: String, val avatar: String)
+
+class GroupInfo(val gid: String, val name: String, val avatar: String, val owner: String, val members: List<String>)
+
+/** Messages live on the phone. One database file per account. Group chats use peer = "g:<groupId>". */
 object Store {
-    private class Helper(ctx: Context, name: String) : SQLiteOpenHelper(ctx, name, null, 1) {
+    private class Helper(ctx: Context, name: String) : SQLiteOpenHelper(ctx, name, null, 2) {
         override fun onCreate(db: SQLiteDatabase) {
             db.execSQL("CREATE TABLE chats(peer TEXT PRIMARY KEY, name TEXT, last TEXT, lastTs INTEGER, unread INTEGER)")
-            db.execSQL("CREATE TABLE msgs(id TEXT PRIMARY KEY, peer TEXT, mine INTEGER, body TEXT, ts INTEGER, status INTEGER)")
+            db.execSQL("CREATE TABLE msgs(id TEXT PRIMARY KEY, peer TEXT, mine INTEGER, body TEXT, ts INTEGER, status INTEGER, sender TEXT)")
             db.execSQL("CREATE INDEX idx_msgs_peer ON msgs(peer, ts)")
+            v2(db)
         }
 
-        override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+        private fun v2(db: SQLiteDatabase) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS people(user TEXT PRIMARY KEY, name TEXT, avatar TEXT)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS grp(gid TEXT PRIMARY KEY, name TEXT, avatar TEXT, owner TEXT, members TEXT)")
+        }
+
+        override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+            if (oldVersion < 2) {
+                try {
+                    db.execSQL("ALTER TABLE msgs ADD COLUMN sender TEXT")
+                } catch (e: Throwable) {
+                }
+                v2(db)
+            }
+        }
     }
 
     private var helper: Helper? = null
@@ -44,22 +63,36 @@ object Store {
         return h.writableDatabase
     }
 
-    private fun preview(s: String): String = s.replace('\n', ' ').take(90)
+    private fun clip(s: String): String = s.replace('\n', ' ').take(90)
+
+    private fun previewOf(peer: String, mine: Boolean, sender: String, body: String): String {
+        if (!peer.startsWith("g:")) return clip(body)
+        if (mine) return clip("You: $body")
+        val n = person(sender)?.name ?: sender
+        return clip(if (n.isEmpty()) body else "$n: $body")
+    }
 
     // ---------- chats ----------
+    private const val CHAT_SQL =
+        "SELECT c.peer, c.name, c.last, c.lastTs, c.unread, COALESCE(p.avatar, g.avatar, '') " +
+            "FROM chats c LEFT JOIN people p ON p.user = c.peer LEFT JOIN grp g ON ('g:' || g.gid) = c.peer "
+
+    private fun readChat(c: Cursor): Chat =
+        Chat(c.getString(0), c.getString(1) ?: c.getString(0), c.getString(2) ?: "", c.getLong(3), c.getInt(4), c.getString(5) ?: "")
+
     @Synchronized
     fun chatList(): List<Chat> {
         val out = ArrayList<Chat>()
-        db().rawQuery("SELECT peer, name, last, lastTs, unread FROM chats ORDER BY lastTs DESC", null).use { c ->
-            while (c.moveToNext()) out.add(Chat(c.getString(0), c.getString(1) ?: c.getString(0), c.getString(2) ?: "", c.getLong(3), c.getInt(4)))
+        db().rawQuery(CHAT_SQL + "ORDER BY c.lastTs DESC", null).use { c ->
+            while (c.moveToNext()) out.add(readChat(c))
         }
         return out
     }
 
     @Synchronized
     fun getChat(peer: String): Chat? {
-        db().rawQuery("SELECT peer, name, last, lastTs, unread FROM chats WHERE peer=?", arrayOf(peer)).use { c ->
-            if (c.moveToFirst()) return Chat(c.getString(0), c.getString(1) ?: c.getString(0), c.getString(2) ?: "", c.getLong(3), c.getInt(4))
+        db().rawQuery(CHAT_SQL + "WHERE c.peer=?", arrayOf(peer)).use { c ->
+            if (c.moveToFirst()) return readChat(c)
         }
         return null
     }
@@ -91,6 +124,83 @@ object Store {
         return 0
     }
 
+    // ---------- people (profiles of everyone we know) ----------
+    @Synchronized
+    fun upsertPerson(user: String, name: String, avatar: String) {
+        val cv = ContentValues()
+        cv.put("user", user)
+        cv.put("name", name)
+        cv.put("avatar", avatar)
+        db().insertWithOnConflict("people", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+        if (name.isNotEmpty()) db().execSQL("UPDATE chats SET name=? WHERE peer=?", arrayOf<Any?>(name, user))
+    }
+
+    @Synchronized
+    fun person(user: String): Person? {
+        db().rawQuery("SELECT user, name, avatar FROM people WHERE user=?", arrayOf(user)).use { c ->
+            if (c.moveToFirst()) return Person(c.getString(0), c.getString(1) ?: c.getString(0), c.getString(2) ?: "")
+        }
+        return null
+    }
+
+    @Synchronized
+    fun people(): List<Person> {
+        val out = ArrayList<Person>()
+        db().rawQuery("SELECT user, name, avatar FROM people ORDER BY name COLLATE NOCASE", null).use { c ->
+            while (c.moveToNext()) out.add(Person(c.getString(0), c.getString(1) ?: c.getString(0), c.getString(2) ?: ""))
+        }
+        return out
+    }
+
+    /** usernames of everyone we chat with or share a group with (used to fetch their statuses/profiles) */
+    @Synchronized
+    fun contactNames(): List<String> {
+        val out = LinkedHashSet<String>()
+        db().rawQuery("SELECT peer FROM chats WHERE peer NOT LIKE 'g:%' UNION SELECT user FROM people", null).use { c ->
+            while (c.moveToNext()) out.add(c.getString(0))
+        }
+        return out.toList()
+    }
+
+    // ---------- groups ----------
+    @Synchronized
+    fun upsertGroup(g: GroupInfo) {
+        val cv = ContentValues()
+        cv.put("gid", g.gid)
+        cv.put("name", g.name)
+        cv.put("avatar", g.avatar)
+        cv.put("owner", g.owner)
+        cv.put("members", g.members.joinToString(","))
+        db().insertWithOnConflict("grp", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+        ensureChat("g:" + g.gid, g.name)
+    }
+
+    @Synchronized
+    fun getGroup(gid: String): GroupInfo? {
+        db().rawQuery("SELECT gid, name, avatar, owner, members FROM grp WHERE gid=?", arrayOf(gid)).use { c ->
+            if (c.moveToFirst()) {
+                val m = (c.getString(4) ?: "").split(",").filter { it.isNotEmpty() }
+                return GroupInfo(c.getString(0), c.getString(1) ?: "", c.getString(2) ?: "", c.getString(3) ?: "", m)
+            }
+        }
+        return null
+    }
+
+    @Synchronized
+    fun groupIds(): List<String> {
+        val out = ArrayList<String>()
+        db().rawQuery("SELECT gid FROM grp", null).use { c ->
+            while (c.moveToNext()) out.add(c.getString(0))
+        }
+        return out
+    }
+
+    @Synchronized
+    fun deleteGroup(gid: String) {
+        db().execSQL("DELETE FROM grp WHERE gid=?", arrayOf<Any?>(gid))
+        deleteChat("g:$gid")
+    }
+
     // ---------- messages ----------
     /** Returns false if a message with this id already exists (duplicates are ignored). */
     @Synchronized
@@ -103,23 +213,27 @@ object Store {
         cv.put("body", m.body)
         cv.put("ts", m.ts)
         cv.put("status", m.status)
+        cv.put("sender", m.sender)
         val r = db().insertWithOnConflict("msgs", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
         if (r == -1L) return false
         db().execSQL(
             "UPDATE chats SET last=?, lastTs=?, unread=unread+? WHERE peer=?",
-            arrayOf<Any?>(preview(m.body), m.ts, if (m.mine) 0 else 1, m.peer)
+            arrayOf<Any?>(previewOf(m.peer, m.mine, m.sender, m.body), m.ts, if (m.mine) 0 else 1, m.peer)
         )
         return true
     }
+
+    private fun readMsg(c: Cursor): Msg =
+        Msg(c.getString(0), c.getString(1), c.getInt(2) == 1, c.getString(3) ?: "", c.getLong(4), c.getInt(5), c.getString(6) ?: "")
 
     @Synchronized
     fun messages(peer: String): List<Msg> {
         val out = ArrayList<Msg>()
         db().rawQuery(
-            "SELECT id, peer, mine, body, ts, status FROM (SELECT * FROM msgs WHERE peer=? ORDER BY ts DESC LIMIT 600) ORDER BY ts ASC",
+            "SELECT id, peer, mine, body, ts, status, sender FROM (SELECT * FROM msgs WHERE peer=? ORDER BY ts DESC LIMIT 600) ORDER BY ts ASC",
             arrayOf(peer)
         ).use { c ->
-            while (c.moveToNext()) out.add(Msg(c.getString(0), c.getString(1), c.getInt(2) == 1, c.getString(3) ?: "", c.getLong(4), c.getInt(5)))
+            while (c.moveToNext()) out.add(readMsg(c))
         }
         return out
     }
@@ -140,10 +254,10 @@ object Store {
         val out = ArrayList<Msg>()
         val since = System.currentTimeMillis() - Config.TTL_SECONDS * 1000L
         db().rawQuery(
-            "SELECT id, peer, mine, body, ts, status FROM msgs WHERE mine=1 AND status IN (0,3) AND ts>? ORDER BY ts ASC LIMIT 50",
+            "SELECT id, peer, mine, body, ts, status, sender FROM msgs WHERE mine=1 AND status IN (0,3) AND ts>? ORDER BY ts ASC LIMIT 50",
             arrayOf(since.toString())
         ).use { c ->
-            while (c.moveToNext()) out.add(Msg(c.getString(0), c.getString(1), true, c.getString(3) ?: "", c.getLong(4), c.getInt(5)))
+            while (c.moveToNext()) out.add(readMsg(c))
         }
         return out
     }
@@ -151,9 +265,9 @@ object Store {
     private fun refreshLast(peer: String) {
         var last = ""
         var ts = 0L
-        db().rawQuery("SELECT body, ts FROM msgs WHERE peer=? ORDER BY ts DESC LIMIT 1", arrayOf(peer)).use { c ->
+        db().rawQuery("SELECT body, ts, mine, sender FROM msgs WHERE peer=? ORDER BY ts DESC LIMIT 1", arrayOf(peer)).use { c ->
             if (c.moveToFirst()) {
-                last = preview(c.getString(0) ?: "")
+                last = previewOf(peer, c.getInt(2) == 1, c.getString(3) ?: "", c.getString(0) ?: "")
                 ts = c.getLong(1)
             }
         }
