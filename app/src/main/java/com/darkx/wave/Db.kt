@@ -19,6 +19,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.security.SecureRandom
 import java.util.Date
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
@@ -28,6 +29,9 @@ import javax.crypto.spec.PBEKeySpec
  *  wave_users:    _id=username, name, salt, hash, pub (public key), phoneHash?, created, seen
  *  wave_inbox:    _id=messageId, from, to, ct (encrypted, Base64), createdAt   -> TTL 24h, deleted once delivered
  *  wave_receipts: _id=messageId, to=original sender, createdAt                 -> TTL 24h, tells the sender "delivered"
+ *  wave_groups:   _id=groupId, name, avatar (https link), owner, members[], createdAt
+ *  wave_status:   _id=statusId, user, url (https image link), caption, createdAt     -> TTL 24h
+ * wave_users also holds: avatar (https link of the profile picture)
  */
 object Db {
     private var cli: MongoClient? = null
@@ -95,7 +99,7 @@ object Db {
 
     private fun buildUri(raw: String): String {
         val uri = raw.trim()
-        if (uri.contains("<password>") || uri.contains("<db_password>")) throw Exception("mongo.txt: badilisha <password> na nenosiri halisi")
+        if (uri.contains("<password>") || uri.contains("<db_password>")) throw Exception("mongo.txt: replace <password> with the real password")
         var base: String
         val opts = LinkedHashMap<String, String>()
         if (uri.startsWith("mongodb+srv://")) {
@@ -147,6 +151,9 @@ object Db {
         idx { d.getCollection(Config.COL_INBOX).createIndex(Indexes.ascending("createdAt"), IndexOptions().expireAfter(Config.TTL_SECONDS, TimeUnit.SECONDS)) }
         idx { d.getCollection(Config.COL_RECEIPTS).createIndex(Indexes.ascending("to")) }
         idx { d.getCollection(Config.COL_RECEIPTS).createIndex(Indexes.ascending("createdAt"), IndexOptions().expireAfter(Config.TTL_SECONDS, TimeUnit.SECONDS)) }
+        idx { d.getCollection(Config.COL_GROUPS).createIndex(Indexes.ascending("members")) }
+        idx { d.getCollection(Config.COL_STATUS).createIndex(Indexes.ascending("user")) }
+        idx { d.getCollection(Config.COL_STATUS).createIndex(Indexes.ascending("createdAt"), IndexOptions().expireAfter(Config.TTL_SECONDS, TimeUnit.SECONDS)) }
         return n
     }
 
@@ -155,10 +162,14 @@ object Db {
     private fun users(): MongoCollection<Document> = db().getCollection(Config.COL_USERS)
     private fun inbox(): MongoCollection<Document> = db().getCollection(Config.COL_INBOX)
     private fun receipts(): MongoCollection<Document> = db().getCollection(Config.COL_RECEIPTS)
+    private fun groups(): MongoCollection<Document> = db().getCollection(Config.COL_GROUPS)
+    private fun statuses(): MongoCollection<Document> = db().getCollection(Config.COL_STATUS)
 
-    class Profile(val username: String, val name: String)
-    class Peer(val username: String, val name: String, val pub: String)
+    class Profile(val username: String, val name: String, val avatar: String = "")
+    class Peer(val username: String, val name: String, val pub: String, val avatar: String = "")
     class Incoming(val id: String, val from: String, val ct: String, val ts: Long)
+    class Status(val id: String, val user: String, val url: String, val caption: String, val ts: Long)
+    class Grp(val gid: String, val name: String, val avatar: String, val owner: String, val members: List<String>)
 
     // ---------- passwords ----------
     private fun newSalt(): String {
@@ -172,7 +183,12 @@ object Db {
         return Base64.encodeToString(SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded, Base64.NO_WRAP)
     }
 
-    private fun netMsg(e: Throwable): String = "Hakuna mawasiliano na seva: " + (e.message ?: e.javaClass.simpleName).replace("\n", " ").take(90)
+    private fun netMsg(e: Throwable): String = "Can't reach the server: " + (e.message ?: e.javaClass.simpleName).replace("\n", " ").take(90)
+
+    private fun peerOf(d: Document): Peer {
+        val id = d.get("_id").toString()
+        return Peer(id, d.getString("name") ?: id, d.getString("pub") ?: "", d.getString("avatar") ?: "")
+    }
 
     // ---------- accounts ----------
     /** returns null on success, otherwise an error message */
@@ -181,6 +197,7 @@ object Db {
             val salt = newSalt()
             val d = Document("_id", username)
                 .append("name", name)
+                .append("avatar", "")
                 .append("salt", salt)
                 .append("hash", hashPw(password, salt))
                 .append("pub", pub)
@@ -191,7 +208,7 @@ object Db {
             users().insertOne(d)
             null
         } catch (e: MongoWriteException) {
-            if ((e.message ?: "").contains("phoneHash")) "Namba hii ya simu imeshasajiliwa" else "Username imeshachukuliwa, jaribu nyingine"
+            if ((e.message ?: "").contains("phoneHash")) "This phone number is already registered" else "Username is already taken, try another"
         } catch (e: Throwable) {
             fail(e)
             reset()
@@ -202,11 +219,11 @@ object Db {
     /** Pair(profile, error). Also publishes this device's public key. */
     fun login(username: String, password: String, pub: String): Pair<Profile?, String?> {
         return try {
-            val d = users().find(Filters.eq("_id", username)).first() ?: return Pair(null, "Akaunti haipo")
+            val d = users().find(Filters.eq("_id", username)).first() ?: return Pair(null, "Account not found")
             val salt = d.getString("salt") ?: ""
-            if (hashPw(password, salt) != d.getString("hash")) return Pair(null, "Nenosiri si sahihi")
+            if (hashPw(password, salt) != d.getString("hash")) return Pair(null, "Wrong password")
             users().updateOne(Filters.eq("_id", username), Updates.combine(Updates.set("pub", pub), Updates.set("seen", Date())))
-            Pair(Profile(username, d.getString("name") ?: username), null)
+            Pair(Profile(username, d.getString("name") ?: username, d.getString("avatar") ?: ""), null)
         } catch (e: Throwable) {
             fail(e)
             reset()
@@ -214,8 +231,9 @@ object Db {
         }
     }
 
-    fun updateName(username: String, name: String) {
-        users().updateOne(Filters.eq("_id", username), Updates.set("name", name))
+    /** Saves display name and profile picture link (empty link = no picture). */
+    fun updateProfile(username: String, name: String, avatar: String) {
+        users().updateOne(Filters.eq("_id", username), Updates.combine(Updates.set("name", name), Updates.set("avatar", avatar)))
     }
 
     /** Find a person by username or by phone number. Throws on network errors. */
@@ -223,14 +241,69 @@ object Db {
         val t = q.trim().removePrefix("@").lowercase()
         val f = if (Phone.looksLikePhone(t)) Filters.eq("phoneHash", Phone.hash(Phone.norm(t))) else Filters.eq("_id", t)
         val d = users().find(f).first() ?: return null
-        val id = d.get("_id").toString()
-        return Peer(id, d.getString("name") ?: id, d.getString("pub") ?: "")
+        return peerOf(d)
     }
 
     fun getUser(username: String): Peer? {
         val d = users().find(Filters.eq("_id", username)).first() ?: return null
-        val id = d.get("_id").toString()
-        return Peer(id, d.getString("name") ?: id, d.getString("pub") ?: "")
+        return peerOf(d)
+    }
+
+    fun getUsers(names: List<String>): List<Peer> {
+        if (names.isEmpty()) return emptyList()
+        val out = ArrayList<Peer>()
+        for (d in users().find(Filters.`in`("_id", names))) out.add(peerOf(d))
+        return out
+    }
+
+    // ---------- groups ----------
+    fun createGroup(g: Grp) {
+        groups().insertOne(
+            Document("_id", g.gid).append("name", g.name).append("avatar", g.avatar)
+                .append("owner", g.owner).append("members", g.members).append("createdAt", Date())
+        )
+    }
+
+    fun fetchGroups(me: String): List<Grp> {
+        val out = ArrayList<Grp>()
+        for (d in groups().find(Filters.eq("members", me)).limit(200)) {
+            val m = (d.get("members") as? List<*>)?.map { it.toString() } ?: emptyList()
+            out.add(Grp(d.get("_id").toString(), d.getString("name") ?: "Group", d.getString("avatar") ?: "", d.getString("owner") ?: "", m))
+        }
+        return out
+    }
+
+    fun leaveGroup(gid: String, me: String) {
+        groups().updateOne(Filters.eq("_id", gid), Updates.pull("members", me))
+        groups().deleteOne(Filters.and(Filters.eq("_id", gid), Filters.size("members", 0)))
+    }
+
+    // ---------- status (image link only, disappears after 24h) ----------
+    fun postStatus(user: String, url: String, caption: String) {
+        statuses().insertOne(
+            Document("_id", UUID.randomUUID().toString()).append("user", user).append("url", url)
+                .append("caption", caption).append("createdAt", Date())
+        )
+    }
+
+    fun fetchStatuses(users: List<String>): List<Status> {
+        if (users.isEmpty()) return emptyList()
+        val since = Date(System.currentTimeMillis() - Config.TTL_SECONDS * 1000L)
+        val out = ArrayList<Status>()
+        val f = Filters.and(Filters.`in`("user", users), Filters.gt("createdAt", since))
+        for (d in statuses().find(f).sort(Sorts.ascending("createdAt")).limit(400)) {
+            out.add(
+                Status(
+                    d.get("_id").toString(), d.getString("user") ?: "", d.getString("url") ?: "",
+                    d.getString("caption") ?: "", (d.getDate("createdAt") ?: Date()).time
+                )
+            )
+        }
+        return out
+    }
+
+    fun deleteStatus(id: String, user: String) {
+        statuses().deleteOne(Filters.and(Filters.eq("_id", id), Filters.eq("user", user)))
     }
 
     // ---------- messages ----------
