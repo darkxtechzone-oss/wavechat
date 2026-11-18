@@ -159,6 +159,35 @@ class MainActivity : Activity() {
         return t
     }
 
+    private fun avatar(name: String, peer: String, size: Int): View {
+        val tv = TextView(this)
+        tv.text = name.trim()
+            .split(" ")
+            .filter { it.isNotEmpty() }
+            .take(2)
+            .mapNotNull { it.firstOrNull()?.uppercaseChar() }
+            .joinToString("")
+        tv.textSize = size * 0.34f
+        tv.setTextColor(Color.WHITE)
+        tv.typeface = Typeface.DEFAULT_BOLD
+        tv.gravity = Gravity.CENTER
+
+        val colors = intArrayOf(
+            Color.parseColor("#2563EB"),
+            Color.parseColor("#7C3AED"),
+            Color.parseColor("#0891B2"),
+            Color.parseColor("#DB2777")
+        )
+        val color = colors[(peer.hashCode() and Int.MAX_VALUE) % colors.size]
+
+        val bg = GradientDrawable()
+        bg.shape = GradientDrawable.OVAL
+        bg.setColor(color)
+        tv.background = bg
+        tv.layoutParams = ViewGroup.LayoutParams(dp(size), dp(size))
+        return tv
+    }
+
     private fun showFatal(t: Throwable) {
         val txt = "Startup error:\n" + android.util.Log.getStackTraceString(t).take(3500)
         try {
@@ -1112,17 +1141,9 @@ class MainActivity : Activity() {
                 if (n.isEmpty()) {
                     toast("Jina haliwezi kuwa tupu")
                 } else {
-                    Thread {
-                        try {
-                            Db.updateName(Session.user, n)
-                            runOnUiThread {
-                                Session.name = n
-                                showSettings()
-                            }
-                        } catch (e: Throwable) {
-                            runOnUiThread { toast("Hakuna mawasiliano na seva") }
-                        }
-                    }.start()
+                    // Db.updateName haipo kwenye Db.kt, kwa hiyo jina linahifadhiwa kwenye simu tu kwa sasa.
+                    Session.name = n
+                    showSettings()
                 }
             }
             .setNegativeButton("Ghairi", null)
