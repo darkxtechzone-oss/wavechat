@@ -23,6 +23,13 @@ object Session {
             p().edit().putString("name", v).apply()
         }
 
+    /** Link (https) of the profile picture. */
+    var avatar: String
+        get() = p().getString("avatar", "") ?: ""
+        set(v) {
+            p().edit().putString("avatar", v).apply()
+        }
+
     /** Show notifications for new messages. */
     var notif: Boolean
         get() = p().getBoolean("notif", true)
@@ -91,14 +98,22 @@ object Fmt {
         if (ts <= 0L) return ""
         val now = System.currentTimeMillis()
         if (sameDay(ts, now)) return time(ts)
-        if (sameDay(ts, now - 86400000L)) return "Jana"
+        if (sameDay(ts, now - 86400000L)) return "Yesterday"
         return SimpleDateFormat("dd/MM", Locale.getDefault()).format(Date(ts))
     }
 
     fun day(ts: Long): String {
         val now = System.currentTimeMillis()
-        if (sameDay(ts, now)) return "Leo"
-        if (sameDay(ts, now - 86400000L)) return "Jana"
+        if (sameDay(ts, now)) return "Today"
+        if (sameDay(ts, now - 86400000L)) return "Yesterday"
         return SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(ts))
+    }
+}
+
+object Links {
+    /** Only https image links are accepted (profile pictures and status images). */
+    fun valid(s: String): Boolean {
+        val t = s.trim()
+        return t.startsWith("https://") && t.length in 12..500 && !t.contains(' ')
     }
 }
