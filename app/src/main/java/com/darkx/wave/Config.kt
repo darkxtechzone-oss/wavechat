@@ -8,10 +8,13 @@ object Config {
     const val COL_USERS = "wave_users"
     const val COL_INBOX = "wave_inbox"
     const val COL_RECEIPTS = "wave_receipts"
+    const val COL_GROUPS = "wave_groups"
+    const val COL_STATUS = "wave_status"
 
     /** Messages that are not collected stay in the database for 24 hours only (MongoDB TTL index). */
     const val TTL_SECONDS = 86400L
     const val MAX_MSG = 2000
+    const val MAX_GROUP = 50
 
     private var cached: String? = null
 
